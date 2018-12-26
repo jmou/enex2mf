@@ -1,0 +1,7 @@
+[package]
+name = "enex2mf"
+version = "0.1.0"
+authors = ["Joe Mou <joe@mou.fo>"]
+edition = "2018"
+
+[dependencies]
