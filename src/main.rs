@@ -69,16 +69,7 @@ struct Note {
     attributes: NoteAttributes,
 }
 
-enum EnexParserState {
-    Initial,
-    EnExport,
-    Note(Note),
-    NoteAttributes(Note),
-    Done,
-}
-
-// XXX still necessary?
-struct WrappedReader<R: Read> {
+struct EnexReader<R: Read> {
     reader: EventReader<R>,
 }
 
@@ -89,9 +80,47 @@ fn event_to_error(prefix: &str, event: std::result::Result<XmlEvent, xml::reader
     }
 }
 
-impl<R: Read> WrappedReader<R> {
+impl<R: Read> EnexReader<R> {
     fn read_event(&mut self) -> std::result::Result<XmlEvent, xml::reader::Error> {
         self.reader.next()
+    }
+
+    fn read_start_document(&mut self) -> Result<()> {
+        match self.read_event() {
+            Ok(XmlEvent::StartDocument { .. }) => Ok(()),
+            x => {
+                return Err(event_to_error("expected document start, found", x));
+            }
+        }
+    }
+
+    fn read_start_element(&mut self, start_tag: &str) -> Result<()> {
+        match self.read_event() {
+            Ok(XmlEvent::StartElement { ref name, .. }) if name.local_name == start_tag => Ok(()),
+            x => {
+                return Err(event_to_error("expected <en-export>, found", x));
+            }
+        }
+    }
+
+    fn read_start_or_named_end_element(&mut self, end_tag: &str) -> Result<Option<String>> {
+        match self.read_event() {
+            Ok(XmlEvent::StartElement { ref name, .. }) => Ok(Some(name.local_name.clone())),
+            Ok(XmlEvent::EndElement { ref name, .. }) if name.local_name == end_tag => Ok(None),
+            x => {
+                return Err(event_to_error("expected <en-export>, found", x));
+            }
+        }
+    }
+
+    fn read_start_or_end_element(&mut self, start_tag: &str, end_tag: &str) -> Result<bool> {
+        match self.read_event() {
+            Ok(XmlEvent::StartElement { ref name, .. }) if name.local_name == start_tag => Ok(true),
+            Ok(XmlEvent::EndElement { ref name, .. }) if name.local_name == end_tag => Ok(false),
+            x => {
+                return Err(event_to_error("expected <en-export>, found", x));
+            }
+        }
     }
 
     fn text_and_end(&mut self) -> Result<Option<String>> {
@@ -113,11 +142,18 @@ impl<R: Read> WrappedReader<R> {
             }
         }
     }
+}
 
+enum EnexParserState {
+    Initial,
+    EnExport,
+    Note(Note),
+    NoteAttributes(Note),
+    Done,
 }
 
 struct EnexParser<R: Read> {
-    reader: WrappedReader<R>,
+    reader: EnexReader<R>,
     state: EnexParserState,
 }
 
@@ -127,95 +163,96 @@ impl<R: Read> EnexParser<R> {
     fn next_helper(&mut self) -> Result<Option<Note>> {
         match self.state {
             EnexParserState::Initial => {
-                match self.reader.read_event() {
-                    Ok(XmlEvent::StartDocument { .. }) => { }
-                    x => {
-                        return Err(event_to_error("expected document start, found", x));
-                    }
-                }
-                match self.reader.read_event() {
-                    Ok(XmlEvent::StartElement { ref name, .. }) if name.local_name == "en-export" => { }
-                    x => {
-                        return Err(event_to_error("expected <en-export>, found", x));
-                    }
-                }
+                self.reader.read_start_document()?;
+                self.reader.read_start_element("en-export")?;
                 self.state = EnexParserState::EnExport;
                 self.next_helper()
             }
             EnexParserState::EnExport => {
-                match self.reader.read_event() {
-                    Ok(XmlEvent::StartElement { ref name, .. }) if name.local_name == "note" => {
-                        self.state = EnexParserState::Note(Default::default());
-                        self.next_helper()
-                    }
-                    Ok(XmlEvent::EndElement { ref name, .. }) if name.local_name == "en-export" => {
-                        self.state = EnexParserState::Done;
-                        Ok(None)
-                    }
-                    x => {
-                        return Err(event_to_error("expected <note>, found", x));
-                    }
+                if self.reader.read_start_or_end_element("note", "en-export")? {
+                    self.state = EnexParserState::Note(Default::default());
+                    self.next_helper()
+                } else {
+                    self.state = EnexParserState::Done;
+                    Ok(None)
                 }
             }
             EnexParserState::Note(ref mut note) => {
-                match self.reader.read_event() {
-                    Ok(XmlEvent::StartElement { ref name, .. }) => {
-                        match name.local_name.as_str() {
-                            "title" => note.title = self.reader.text_and_end()?,
-                            "content" => note.content = self.reader.text_and_end()?,
-                            "created" => note.created = self.reader.text_and_end()?,
-                            "updated" => note.updated = self.reader.text_and_end()?,
-                            "tag" => note.tags.extend(self.reader.text_and_end()?,),
-                            "note-attributes" => {
-                                // XXX this feels really sketchy
-                                self.state = EnexParserState::NoteAttributes(note.clone());
+                match self.reader.read_start_or_named_end_element("note")?.as_ref().map(String::as_str) {
+                    Some("title") => {
+                        note.title = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("content") => {
+                        note.content = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("created") => {
+                        note.created = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("updated") => {
+                        note.updated = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("tag") => {
+                        note.tags.extend(self.reader.text_and_end()?);
+                        self.next_helper()
+                    }
+                    Some("note-attributes") => {
+                        // XXX this feels really sketchy
+                        self.state = EnexParserState::NoteAttributes(note.clone());
+                        self.next_helper()
+                    }
+                    Some("resource") => {
+                        // TODO emit some sort of placeholder
+                        loop {
+                            match self.reader.read_event() {
+                                Ok(XmlEvent::EndElement { ref name }) if name.local_name == "resource" => break,
+                                _ => { }
                             }
-                            "resource" => {
-                                // TODO emit some sort of placeholder
-                                loop {
-                                    match self.reader.read_event() {
-                                        Ok(XmlEvent::EndElement { ref name }) if name.local_name == "resource" => break,
-                                        _ => { }
-                                    }
-                                }
-                            }
-                            t => return Err(AppError::Parse(format!("unexpected <{}>", t))),
                         }
                         self.next_helper()
                     }
-                    // XXX confirm matching end
-                    Ok(XmlEvent::EndElement { .. }) => {
+                    Some(t) => return Err(AppError::Parse(format!("unexpected <{}>", t))),
+                    None => {
                         let note = note.clone();
                         self.state = EnexParserState::EnExport;
                         Ok(Some(note))
                     }
-                    x => {
-                        return Err(event_to_error("unexpected in <note>:", x));
-                    }
                 }
             }
             EnexParserState::NoteAttributes(ref mut note) => {
-                match self.reader.read_event() {
-                    Ok(XmlEvent::StartElement { ref name, .. }) => {
-                        let attrs = &mut note.attributes;
-                        match name.local_name.as_str() {
-                            "author" => attrs.author = self.reader.text_and_end()?,
-                            "source" => attrs.source = self.reader.text_and_end()?,
-                            "source-url" => attrs.source_url = self.reader.text_and_end()?,
-                            "latitude" => attrs.latitude = self.reader.text_and_end()?,
-                            "longitude" => attrs.longitude = self.reader.text_and_end()?,
-                            "altitude" => attrs.altitude = self.reader.text_and_end()?,
-                            t => return Err(AppError::Parse(format!("unexpected <{}>", t))),
-                        }
+                let attrs = &mut note.attributes;
+                match self.reader.read_start_or_named_end_element("note-attributes")?.as_ref().map(String::as_str) {
+                    Some("author") => {
+                        attrs.author = self.reader.text_and_end()?;
                         self.next_helper()
                     }
-                    // XXX confirm matching end
-                    Ok(XmlEvent::EndElement { .. }) => {
+                    Some("source") => {
+                        attrs.source = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("source-url") => {
+                        attrs.source_url = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("latitude") => {
+                        attrs.latitude = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("longitude") => {
+                        attrs.longitude = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some("altitude") => {
+                        attrs.altitude = self.reader.text_and_end()?;
+                        self.next_helper()
+                    }
+                    Some(t) => return Err(AppError::Parse(format!("unexpected <{}>", t))),
+                    None => {
                         self.state = EnexParserState::Note(note.clone());
                         self.next_helper()
-                    }
-                    x => {
-                        return Err(event_to_error("unexpected in <note-attributes>:", x));
                     }
                 }
             }
@@ -305,7 +342,7 @@ fn main() -> std::result::Result<(), Error> {
 
     // XXX factor ::new()
     let mut parser = EnexParser {
-        reader: WrappedReader {
+        reader: EnexReader {
             reader: ParserConfig::new().trim_whitespace(true).cdata_to_characters(true).create_reader(file),
         },
         state: EnexParserState::Initial,
