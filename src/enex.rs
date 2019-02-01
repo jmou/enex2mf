@@ -1,9 +1,11 @@
+//! Parses a .enex Evernote export using xml-rs pull parser.
+
 use crate::error::{Error, Result};
 use chrono::{DateTime, Local};
 use std::io::Read;
 use xml::reader::{EventReader, ParserConfig, XmlEvent};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct NoteAttributes {
     pub author: Option<String>,
     pub source_url: Option<String>,
@@ -13,7 +15,7 @@ pub struct NoteAttributes {
     pub altitude: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Note {
     pub title: Option<String>,
     pub content: Option<String>,
@@ -23,10 +25,15 @@ pub struct Note {
     pub attributes: NoteAttributes,
 }
 
+/// This is split from EnexParser to avoid multiple mutable borrows; see
+/// https://github.com/rust-lang/rfcs/issues/1215. It also lets us encapsulate low-level XML event
+/// parsing.
 struct EnexReader<R: Read> {
     reader: EventReader<R>,
 }
 
+/// `consume_*` methods read and ignore an event. `read_*` methods read an event and return a
+/// parsed value.
 impl<R: Read> EnexReader<R> {
     fn consume_start_document(&mut self) -> Result<()> {
         match self.reader.next()? {
@@ -58,6 +65,7 @@ impl<R: Read> EnexReader<R> {
         }
     }
 
+    /// Return `Ok(Some(start_tag))` for `<start_tag>` or `Ok(None)` for `</end_tag>`.
     fn read_start_element_until_enclosing(&mut self, end_tag: &str) -> Result<Option<String>> {
         match self.reader.next()? {
             XmlEvent::StartElement { name, .. } => Ok(Some(name.local_name)),
@@ -66,6 +74,7 @@ impl<R: Read> EnexReader<R> {
         }
     }
 
+    /// Return the text until `</end_tag>`.
     fn read_text_until_enclosing(&mut self, end_tag: &str) -> Result<Option<String>> {
         match self.reader.next()? {
             XmlEvent::Characters(text) => {
@@ -79,6 +88,7 @@ impl<R: Read> EnexReader<R> {
         }
     }
 
+    /// Return the parsed date until `</end_tag>`.
     fn read_datetime_until_enclosing(&mut self, end_tag: &str) -> Result<Option<DateTime<Local>>> {
         let text = self.read_text_until_enclosing(end_tag)?;
         let text = text.as_ref().map(String::as_str).unwrap_or("");
@@ -88,8 +98,8 @@ impl<R: Read> EnexReader<R> {
         ))
     }
 
+    /// Skip until `</resource>`.
     fn consume_resource(&mut self) -> Result<()> {
-        // Skip <resource>.
         loop {
             match self.reader.next()? {
                 XmlEvent::EndElement { ref name } if name.local_name == "resource" => break,
@@ -106,6 +116,18 @@ enum EnexParserState {
     Done,
 }
 
+/// The .enex parser is implemented as a simple state machine.
+///
+/// # Example
+///
+/// ```
+/// use crate::enex::EnexParser;
+/// let buf = b"<en-export><note><title>foo</title></note></en-export>".as_bytes();
+/// let parser = EnexParser::new(buf);
+/// for note in parser {
+///     println!("{:?}", note?);
+/// }
+/// ```
 pub struct EnexParser<R: Read> {
     reader: EnexReader<R>,
     state: EnexParserState,
@@ -121,6 +143,37 @@ impl<R: Read> EnexParser<R> {
                     .create_reader(reader),
             },
             state: EnexParserState::Initial,
+        }
+    }
+
+    /// The main logic starts here. For ergonomics we return a Result<Option<Note>> here instead of
+    /// the Option<Result<Note>> required by Iterator::next.
+    fn next_helper(&mut self) -> Result<Option<Note>> {
+        loop {
+            match self.state {
+                EnexParserState::Initial => {
+                    self.reader.consume_start_document()?;
+                    self.reader.consume_start_element("en-export")?;
+                    self.state = EnexParserState::EnExport;
+                }
+                EnexParserState::EnExport => {
+                    return match self
+                        .reader
+                        .read_start_element_until_enclosing("en-export")?
+                        .as_ref()
+                        .map(String::as_str)
+                    {
+                        Some("note") => Ok(Some(self.read_note()?)),
+                        Some(tag) => Err(Error::UnexpectedElement(tag.to_owned())),
+                        None => {
+                            self.reader.consume_end_document()?;
+                            self.state = EnexParserState::Done;
+                            Ok(None)
+                        }
+                    };
+                }
+                EnexParserState::Done => return Ok(None),
+            }
         }
     }
 
@@ -168,40 +221,12 @@ impl<R: Read> EnexParser<R> {
         }
         Ok(attrs)
     }
-
-    fn next_helper(&mut self) -> Result<Option<Note>> {
-        loop {
-            match self.state {
-                EnexParserState::Initial => {
-                    self.reader.consume_start_document()?;
-                    self.reader.consume_start_element("en-export")?;
-                    self.state = EnexParserState::EnExport;
-                }
-                EnexParserState::EnExport => {
-                    return match self
-                        .reader
-                        .read_start_element_until_enclosing("en-export")?
-                        .as_ref()
-                        .map(String::as_str)
-                    {
-                        Some("note") => Ok(Some(self.read_note()?)),
-                        Some(tag) => Err(Error::UnexpectedElement(tag.to_owned())),
-                        None => {
-                            self.reader.consume_end_document()?;
-                            self.state = EnexParserState::Done;
-                            Ok(None)
-                        }
-                    };
-                }
-                EnexParserState::Done => return Ok(None),
-            }
-        }
-    }
 }
 
 impl<R: Read> Iterator for EnexParser<R> {
     type Item = Result<Note>;
 
+    /// Translate next_helper() into the proper return type for Iterator::next().
     fn next(&mut self) -> Option<Result<Note>> {
         match self.next_helper() {
             Ok(Some(n)) => Some(Ok(n)),
@@ -209,4 +234,16 @@ impl<R: Read> Iterator for EnexParser<R> {
             Err(e) => Some(Err(e)),
         }
     }
+}
+
+#[test]
+fn test_simple() {
+    let buf = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE en-export SYSTEM "http://xml.evernote.com/pub/evernote-export2.dtd">
+<en-export export-date="20181226T083916Z" application="Evernote/Windows" version="6.x">
+<note><title>foo</title></note>
+</en-export>"#.as_bytes();
+
+    let notes: Vec<Note> = EnexParser::new(buf).map(|x| x.unwrap()).collect();
+    assert_eq!(notes, vec![Note { title: Some("foo".to_string()), .. Note::default() }])
 }

@@ -18,6 +18,7 @@ use std::io::{stdout, BufReader, Write};
 use std::path::Path;
 use std::str;
 
+/// Write a single note in MindForger-compatible Markdown.
 fn write_as_mf<W: Write>(writer: &mut W, note: &Note) -> Result<()> {
     let title = note.title.as_ref().map_or("untitled", String::as_str);
     write!(writer, "# {} <!-- Metadata: type: Note; ", title)?;
